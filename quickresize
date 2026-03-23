@@ -223,7 +223,7 @@ main() {
         if needs_resize "$dims" "$max_dim"; then
             if process_image "$input_file" "$output_file" "$max_dim"; then
                 out_dims=$(get_dimensions "$output_file")
-                echo "RESIZED (${width}x${height} -> ${out_dims})"
+                echo "RESIZED (${width} ${height} -> ${out_dims})"
                 ((resized++)) || true
             else
                 echo "ERROR"
@@ -231,7 +231,7 @@ main() {
             fi
         else
             if process_image "$input_file" "$output_file" "$max_dim"; then
-                echo "COPIED (${width}x${height})"
+                echo "COPIED (${width} ${height})"
                 ((copied++)) || true
             else
                 echo "ERROR"
