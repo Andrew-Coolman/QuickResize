@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+MAX_DIM=2000
+QUALITY=95
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--inplace] [--max N] <source_dir> [output_dir]
+
+Resize images larger than ${MAX_DIM}px (default) to N px on the longest side.
+
+Options:
+    --max N      Maximum dimension in pixels (default: ${MAX_DIM})
+    --inplace    Modify images in the source directory directly
+    -h, --help   Show this help message
+
+Examples:
+    # Resize images from source_dir and save to output_dir
+    $(basename "$0") /path/to/images /path/to/output
+
+    # Resize images with custom max dimension
+    $(basename "$0") --max 1000 /path/to/images /path/to/output
+
+    # Resize images in place
+    $(basename "$0") --inplace /path/to/images
+EOF
+}
+
+install_imagemagick() {
+    local os
+    os=$(uname -s)
+
+    if [[ "$os" == "Darwin" ]]; then
+        if command -v brew &>/dev/null; then
+            echo "Installing ImageMagick via Homebrew..."
+            brew install imagemagick
+        else
+            echo ""
+            echo "Homebrew not found. Installing Homebrew first..."
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+            eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true
+            eval "$(/usr/local/bin/brew shellenv)" 2>/dev/null || true
+
+            echo "Installing ImageMagick via Homebrew..."
+            brew install imagemagick
+        fi
+    else
+        local pkg_mgr=""
+        for cmd in pacman apt dnf yum; do
+            if command -v "$cmd" &>/dev/null; then
+                pkg_mgr="$cmd"
+                break
+            fi
+        done
+
+        case "$pkg_mgr" in
+            pacman)
+                echo "Installing ImageMagick via pacman..."
+                sudo pacman -S imagemagick
+                ;;
+            apt)
+                echo "Installing ImageMagick via apt..."
+                sudo apt install -y imagemagick
+                ;;
+            dnf)
+                echo "Installing ImageMagick via dnf..."
+                sudo dnf install -y imagemagick
+                ;;
+            yum)
+                echo "Installing ImageMagick via yum..."
+                sudo yum install -y imagemagick
+                ;;
+            *)
+                echo "Error: No supported package manager found." >&2
+                echo "Please install ImageMagick manually, then re-run this script." >&2
+                exit 1
+                ;;
+        esac
+    fi
+}
+
+check_imagemagick() {
+    if command -v magick &>/dev/null && command -v identify &>/dev/null; then
+        return 0
+    fi
+
+    echo ""
+    echo "ImageMagick is required but not installed."
+    echo ""
+    read -p "Install ImageMagick now? (yes/no): " -r
+    echo ""
+    if [[ ! "$REPLY" =~ ^[Yy]es$ ]]; then
+        echo "Aborted."
+        exit 1
+    fi
+
+    install_imagemagick
+}
+
+get_dimensions() {
+    local file="$1"
+    identify -format "%w %h" "$file" 2>/dev/null
+}
+
+needs_resize() {
+    local dims="$1"
+    local max="$2"
+    local width height current_max
+    read -r width height <<< "$dims"
+    current_max=$(( width > height ? width : height ))
+    [[ $current_max -gt $max ]]
+}
+
+process_image() {
+    local input="$1"
+    local output="$2"
+    local max="$3"
+    local tmp_file
+
+    tmp_file=$(mktemp /tmp/quickresize_XXXXXX.png)
+
+    magick "$input" -resize "${max}x${max}>" -quality "$QUALITY" "$tmp_file"
+    magick "$tmp_file" "$output"
+    rm -f "$tmp_file"
+}
+
+main() {
+    local in_place=false
+    local source_dir=""
+    local output_dir=""
+    local max_dim=$MAX_DIM
+
+    if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --inplace)
+                in_place=true
+                shift
+                ;;
+            --max)
+                if [[ -z "${2:-}" ]]; then
+                    echo "Error: --max requires a value" >&2
+                    exit 1
+                fi
+                max_dim="$2"
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ $# -lt 1 ]]; then
+        echo "Error: Source directory required" >&2
+        usage
+        exit 1
+    fi
+
+    source_dir="$1"
+
+    if [[ ! -d "$source_dir" ]]; then
+        echo "Error: Source directory '$source_dir' does not exist" >&2
+        exit 1
+    fi
+
+    if [[ "$in_place" == true ]]; then
+        if [[ $# -gt 1 ]]; then
+            echo "Error: --inplace mode does not accept an output directory" >&2
+            exit 1
+        fi
+        output_dir="$source_dir"
+    else
+        if [[ $# -lt 2 ]]; then
+            echo "Error: Output directory required (or use --inplace)" >&2
+            usage
+            exit 1
+        fi
+
+        output_dir="$2"
+
+        if [[ ! -d "$output_dir" ]]; then
+            mkdir -p "$output_dir"
+        fi
+
+        local existing_count
+        existing_count=$(find "$output_dir" -maxdepth 1 -type f | wc -l)
+        if [[ "$existing_count" -gt 0 ]]; then
+            echo "Error: Output directory '$output_dir' is not empty" >&2
+            exit 1
+        fi
+    fi
+
+    check_imagemagick
+
+    local total=0 resized=0 copied=0 errors=0
+
+    while IFS= read -r -d '' input_file; do
+        ((total++)) || true
+        local filename basename output_file dims width height out_dims
+        filename=$(basename "$input_file")
+        basename="${filename%.*}"
+        output_file="${output_dir}/${basename}.jpg"
+
+        printf "[%d] Processing: %s ... " "$total" "$filename"
+
+        dims=$(get_dimensions "$input_file")
+        if [[ -z "$dims" ]]; then
+            echo "SKIP (unreadable)"
+            ((errors++)) || true
+            continue
+        fi
+
+        read -r width height <<< "$dims"
+
+        if needs_resize "$dims" "$max_dim"; then
+            if process_image "$input_file" "$output_file" "$max_dim"; then
+                out_dims=$(get_dimensions "$output_file")
+                echo "RESIZED (${width}x${height} -> ${out_dims})"
+                ((resized++)) || true
+            else
+                echo "ERROR"
+                ((errors++)) || true
+            fi
+        else
+            if process_image "$input_file" "$output_file" "$max_dim"; then
+                echo "COPIED (${width}x${height})"
+                ((copied++)) || true
+            else
+                echo "ERROR"
+                ((errors++)) || true
+            fi
+        fi
+
+        if [[ "$in_place" == true ]]; then
+            rm -f "$input_file"
+        fi
+    done < <(find "$source_dir" -type f \( \
+        -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \
+        -o -iname "*.gif" -o -iname "*.bmp" -o -iname "*.tiff" \
+        -o -iname "*.webp" -o -iname "*.heic" \
+    \) -print0 2>/dev/null)
+
+    echo ""
+    echo "Done! $total total, $resized resized, $copied copied, $errors errors"
+}
+
+main "$@"
